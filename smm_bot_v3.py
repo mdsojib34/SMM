@@ -50,9 +50,9 @@ from pyrogram.types import (
 # =====================================================================
 # STEP 1 CONFIGURATION  (the ONLY place you must edit)
 # =====================================================================
-API_ID = int(os.getenv("API_ID", "0"))                 # <-- my.telegram.org  API_ID
-API_HASH = os.getenv("API_HASH", "")                   # <-- my.telegram.org  API_HASH
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")                 # <-- @BotFather token
+API_ID = int(os.getenv("36497386", "0"))                 # <-- my.telegram.org  API_ID
+API_HASH = os.getenv("bf09e9a32f89d28087b44bcdb043239c", "")                   # <-- my.telegram.org  API_HASH
+BOT_TOKEN = os.getenv("8995940738:AAEnVYIcC72TCi8aH620d9MH2DQIDAGKCMw", "")                 # <-- @BotFather token
 OWNER_IDS = [int(x) for x in os.getenv("ADMINS", "0").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()]
 DB_FILE = os.getenv("DB_FILE", "smm_panel.db")         # SQLite database file
 BACKUP_DIR = os.getenv("BACKUP_DIR", "backups")        # auto backup folder
