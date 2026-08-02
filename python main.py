@@ -12,7 +12,7 @@
  INSTALL
    pip install pyrogram tgcrypto requests
  RUN
-   python smm_bot_v3.py
+   python main.py
 
  CONFIG -> see "STEP 1 CONFIGURATION" block below (lines ~60-75).
  Everything else is managed inside the bot: /admin
