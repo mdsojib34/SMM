@@ -26,7 +26,6 @@ import json
 import time
 import random
 import string
-import shutil
 import sqlite3
 import asyncio
 import logging
@@ -55,12 +54,9 @@ API_HASH = os.getenv("bf09e9a32f89d28087b44bcdb043239c", "")                   #
 BOT_TOKEN = os.getenv("8995940738:AAEnVYIcC72TCi8aH620d9MH2DQIDAGKCMw", "")                 # <-- @BotFather token
 OWNER_IDS = [int(x) for x in os.getenv("ADMINS", "0").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()]
 DB_FILE = os.getenv("DB_FILE", "smm_panel.db")         # SQLite database file
-BACKUP_DIR = os.getenv("BACKUP_DIR", "backups")        # auto backup folder
 LOG_FILE = os.getenv("LOG_FILE", "smm_bot.log")
 SESSION_NAME = os.getenv("SESSION_NAME", "smm_panel_bot")
 # =====================================================================
-
-os.makedirs(BACKUP_DIR, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -187,6 +183,10 @@ CREATE TABLE IF NOT EXISTS buttons(
 CREATE TABLE IF NOT EXISTS settings(
     key TEXT PRIMARY KEY, value TEXT);
 
+CREATE TABLE IF NOT EXISTS force_channels(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, title TEXT DEFAULT '',
+    invite_link TEXT DEFAULT '', active INTEGER DEFAULT 1, sort INTEGER DEFAULT 100, added INTEGER);
+
 CREATE TABLE IF NOT EXISTS logs(
     id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT, actor INTEGER, action TEXT, detail TEXT, created INTEGER);
 """
@@ -227,8 +227,7 @@ DEFAULT_SETTINGS = {
     "profit_percent": "20",         # markup added on provider rate
     "min_order_amount": "1",
     "support_username": "",
-    "channel_username": "",
-    "force_join": "0",
+    "force_join": "1",
     "maintenance": "0",
     "languages": "en,bn",
     "default_lang": "en",
@@ -242,7 +241,6 @@ DEFAULT_SETTINGS = {
     "auto_refill": "0",
     "status_interval": "180",       # seconds between order status polls
     "sync_interval": "21600",       # seconds between service re-sync
-    "backup_interval": "86400",     # seconds between auto backups
     "flood_limit": "6",             # messages per 5 seconds
     "page_size": "8",
     "admin_log_chat": "0",
@@ -330,7 +328,9 @@ DEFAULT_TEXTS = {
         "terms": "📜 <b>Terms of Service</b>\n\nBy using this bot you accept that all services are delivered as-is by third-party providers.",
         "privacy": "🔐 <b>Privacy Policy</b>\n\nWe store only your Telegram ID, username and order data required to operate the service.",
         "maintenance": "🛠 <b>Maintenance</b>\n\nThe bot is temporarily unavailable. Please try again later.",
-        "force_join": "🔒 <b>Join required</b>\n\nPlease join {channel} to use this bot, then press ✅ Joined.",
+        "force_join": "🔒 <b>Join required</b>\n\nTo use this bot you must join the channel(s) below:\n{channels}\n\nAfter joining, press <b>✅ Verify Join</b>.",
+        "force_join_ok": "✅ Verified! Welcome.",
+        "force_join_fail": "❌ You have not joined all required channels yet.",
         "banned": "🚫 Your account has been suspended. Contact support.",
         "flood": "🐢 Slow down please.",
         "error": "⚠️ Something went wrong. Please try again.",
@@ -350,6 +350,9 @@ DEFAULT_TEXTS = {
         "maintenance": "🛠 বট আপাতত বন্ধ আছে, পরে চেষ্টা করুন।",
         "banned": "🚫 আপনার অ্যাকাউন্ট বন্ধ করা হয়েছে।",
         "cancelled": "❌ বাতিল করা হয়েছে।",
+        "force_join": "🔒 <b>জয়েন করা আবশ্যক</b>\n\nবট ব্যবহার করতে নিচের চ্যানেলগুলোতে জয়েন করুন:\n{channels}\n\nজয়েন করে <b>✅ Verify Join</b> চাপুন।",
+        "force_join_ok": "✅ ভেরিফাই সম্পন্ন!",
+        "force_join_fail": "❌ আপনি এখনো সব চ্যানেলে জয়েন করেননি।",
     },
 }
 
@@ -886,18 +889,90 @@ async def guard(ev) -> bool:
     if SB("maintenance", False) and not is_admin(uid):
         await render(ev, T("maintenance", lang))
         return False
-    ch = S("channel_username", "").lstrip("@")
-    if SB("force_join", False) and ch and not is_admin(uid):
-        try:
-            await app.get_chat_member(f"@{ch}", uid)
-        except RPCError:
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{ch}")],
-                [InlineKeyboardButton("✅ Joined", callback_data="home")],
-            ])
-            await render(ev, T("force_join", lang, channel=f"@{ch}"), kb)
-            return False
+    missing = await fj_missing(uid)
+    if missing:
+        await render(ev, T("force_join", lang, channels=fj_list_text(missing)), fj_keyboard(missing))
+        return False
     return True
+
+
+# =====================================================================
+# FORCE JOIN CHANNEL MANAGER (fully dynamic, stored in SQLite)
+# =====================================================================
+def fj_channels(active_only: bool = True) -> list:
+    sql = "SELECT * FROM force_channels"
+    if active_only:
+        sql += " WHERE active=1"
+    sql += " ORDER BY sort ASC, id ASC"
+    return q(sql)
+
+
+def fj_ref(ch: dict) -> str:
+    """Chat reference usable with get_chat_member (@username or -100... id)."""
+    cid = str(ch.get("chat_id") or "").strip()
+    if cid.lstrip("-").isdigit():
+        return cid
+    return "@" + cid.lstrip("@")
+
+
+def fj_link(ch: dict) -> str:
+    link = (ch.get("invite_link") or "").strip()
+    if link:
+        return link
+    cid = str(ch.get("chat_id") or "").strip()
+    if cid and not cid.lstrip("-").isdigit():
+        return f"https://t.me/{cid.lstrip('@')}"
+    return ""
+
+
+def fj_title(ch: dict) -> str:
+    return clean(ch.get("title") or str(ch.get("chat_id") or ""), 60)
+
+
+async def fj_missing(uid: int) -> list:
+    """Channels the user has NOT joined yet."""
+    if not SB("force_join", False) or is_admin(uid):
+        return []
+    missing = []
+    for ch in fj_channels():
+        ref = fj_ref(ch)
+        if not ref or ref == "@":
+            continue
+        try:
+            member = await app.get_chat_member(ref, uid)
+            status = getattr(member, "status", None)
+            if status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED):
+                missing.append(ch)
+        except RPCError as e:
+            txt = str(e).upper()
+            if "USER_NOT_PARTICIPANT" in txt:
+                missing.append(ch)
+            elif any(k in txt for k in ("CHANNEL_INVALID", "CHAT_ADMIN_REQUIRED", "PEER_ID_INVALID",
+                                        "USERNAME_NOT_OCCUPIED", "CHANNEL_PRIVATE")):
+                audit("WARN", 0, "force_join_unreachable", f"{ref}: {e}")
+            else:
+                missing.append(ch)
+        except Exception as e:  # noqa: BLE001
+            audit("ERROR", 0, "force_join_check", f"{ref}: {e}")
+    return missing
+
+
+def fj_keyboard(missing: list) -> InlineKeyboardMarkup:
+    rows = []
+    for ch in missing:
+        link = fj_link(ch)
+        if link:
+            rows.append([InlineKeyboardButton(f"📢 Join {fj_title(ch)}", url=link)])
+    rows.append([InlineKeyboardButton("✅ Verify Join", callback_data="fjverify")])
+    return InlineKeyboardMarkup(rows)
+
+
+def fj_list_text(missing: list) -> str:
+    lines = []
+    for ch in missing:
+        link = fj_link(ch)
+        lines.append(f"• <a href=\"{link}\">{fj_title(ch)}</a>" if link else f"• {fj_title(ch)}")
+    return "\n".join(lines) or "—"
 
 
 def home_text(uid: int) -> str:
@@ -992,6 +1067,14 @@ async def on_cb(_, cq: CallbackQuery):
             if not is_admin(uid):
                 return await cq.answer("🚫 Not authorised.", show_alert=True)
             return await admin_router(cq, data[4:])
+        if data == "fjverify":
+            missing = await fj_missing(uid)
+            if missing:
+                await cq.answer(T("force_join_fail", ulang(uid)), show_alert=True)
+                return await render(cq, T("force_join", ulang(uid), channels=fj_list_text(missing)),
+                                    fj_keyboard(missing))
+            await cq.answer(T("force_join_ok", ulang(uid)), show_alert=True)
+            return await render(cq, home_text(uid), main_menu(uid))
         if not await guard(cq):
             return
         await user_router(cq, data)
@@ -1400,8 +1483,8 @@ def admin_home_kb(uid: int) -> InlineKeyboardMarkup:
          InlineKeyboardButton("🎛 Menu Buttons", callback_data="adm:btn:list")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="adm:set:0"),
          InlineKeyboardButton("📈 Statistics", callback_data="adm:stats")],
-        [InlineKeyboardButton("🗒 Logs", callback_data="adm:logs"),
-         InlineKeyboardButton("💾 Backup", callback_data="adm:backup")],
+        [InlineKeyboardButton("🔒 Force Join", callback_data="adm:fj:list"),
+         InlineKeyboardButton("🗒 Logs", callback_data="adm:logs")],
         [InlineKeyboardButton("🛠 Toggle Maintenance", callback_data="adm:maint")],
         [InlineKeyboardButton("🏠 User Menu", callback_data="home")],
     ])
@@ -1425,17 +1508,6 @@ async def admin_router(cq: CallbackQuery, d: str):
         set_setting("maintenance", "0" if SB("maintenance") else "1")
         audit("WARN", uid, "maintenance", S("maintenance"))
         return await render(cq, admin_home_text(), admin_home_kb(uid))
-
-    if d == "backup":
-        path = os.path.join(BACKUP_DIR, f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
-        with _lock:
-            _conn.commit()
-            shutil.copy(DB_FILE, path)
-        try:
-            await app.send_document(cq.message.chat.id, path, caption="💾 Database backup")
-        except RPCError:
-            pass
-        return await cq.answer("✅ Backup created.", show_alert=True)
 
     if d == "stats":
         t = now_ts() - 86400
@@ -1463,6 +1535,76 @@ async def admin_router(cq: CallbackQuery, d: str):
         body = "\n".join(f"<code>{datetime.utcfromtimestamp(l['created']).strftime('%m-%d %H:%M')}</code> "
                          f"[{l['level']}] {clean(l['action'],30)} — {clean(l['detail'],60)}" for l in rows)
         return await render(cq, "🗒 <b>Recent logs</b>\n\n" + (body or "empty"), akb([]))
+
+    # ---------------- force join channels ----------------
+    if d == "fj:list":
+        rows = fj_channels(active_only=False)
+        kb = [[InlineKeyboardButton(f"{'✅' if c['active'] else '⛔️'} {c['sort']} · {fj_title(c)}",
+                                    callback_data=f"adm:fj:ch:{c['id']}")] for c in rows]
+        kb.append([InlineKeyboardButton("➕ Add channel", callback_data="adm:fj:add")])
+        kb.append([InlineKeyboardButton(f"🔒 Force Join: {'ON' if SB('force_join') else 'OFF'}",
+                                        callback_data="adm:fj:toggle")])
+        return await render(cq, ("🔒 <b>Force Join Manager</b>\n\n"
+                                 f"Channels: <b>{len(rows)}</b> (active {len([c for c in rows if c['active']])})\n"
+                                 "Add public channels by @username or private channels by numeric ID + invite link.\n"
+                                 "⚠️ The bot must be an admin in every channel."), akb(kb))
+
+    if d == "fj:toggle":
+        set_setting("force_join", "0" if SB("force_join") else "1")
+        audit("WARN", uid, "force_join_toggle", S("force_join"))
+        return await admin_router(cq, "fj:list")
+
+    if d == "fj:add":
+        set_state(uid, "adm_fj_add")
+        return await render(cq, ("➕ <b>Add force-join channel</b>\n\n"
+                                 "Send: <code>@username | Title | invite link (optional)</code>\n"
+                                 "Private channel: <code>-1001234567890 | VIP | https://t.me/+abc123</code>"),
+                            akb([], "adm:fj:list"))
+
+    if d.startswith("fj:ch:"):
+        cid = int(d.split(":")[2])
+        c = one("SELECT * FROM force_channels WHERE id=?", (cid,))
+        if not c:
+            return await cq.answer("Not found.", show_alert=True)
+        kb = [
+            [InlineKeyboardButton("✏️ Edit username/ID", callback_data=f"adm:fj:edit:{cid}"),
+             InlineKeyboardButton("🏷 Edit title", callback_data=f"adm:fj:title:{cid}")],
+            [InlineKeyboardButton("🔗 Edit invite link", callback_data=f"adm:fj:link:{cid}"),
+             InlineKeyboardButton("↕️ Change order", callback_data=f"adm:fj:sort:{cid}")],
+            [InlineKeyboardButton("⛔️ Disable" if c["active"] else "✅ Enable",
+                                  callback_data=f"adm:fj:tog:{cid}"),
+             InlineKeyboardButton("🗑 Remove", callback_data=f"adm:fj:del:{cid}")],
+        ]
+        return await render(cq, (f"🔒 <b>Channel #{cid}</b>\n\n"
+                                 f"🆔 <code>{clean(c['chat_id'], 60)}</code>\n"
+                                 f"🏷 {fj_title(c)}\n"
+                                 f"🔗 {clean(c['invite_link'] or fj_link(c) or 'none', 80)}\n"
+                                 f"↕️ Order: <b>{c['sort']}</b>\n"
+                                 f"📶 Status: <b>{'active' if c['active'] else 'disabled'}</b>"),
+                            akb(kb, "adm:fj:list"))
+
+    if d.startswith("fj:tog:"):
+        cid = int(d.split(":")[2])
+        run("UPDATE force_channels SET active=1-active WHERE id=?", (cid,))
+        audit("INFO", uid, "force_channel_toggle", cid)
+        return await admin_router(cq, f"fj:ch:{cid}")
+
+    if d.startswith("fj:del:"):
+        cid = int(d.split(":")[2])
+        run("DELETE FROM force_channels WHERE id=?", (cid,))
+        audit("WARN", uid, "force_channel_delete", cid)
+        return await admin_router(cq, "fj:list")
+
+    if d.startswith("fj:edit:") or d.startswith("fj:title:") or d.startswith("fj:link:") or d.startswith("fj:sort:"):
+        kind, cid = d.split(":")[1], int(d.split(":")[2])
+        prompts = {
+            "edit": "✏️ Send new <b>@username</b> or numeric channel ID:",
+            "title": "🏷 Send new <b>title</b>:",
+            "link": "🔗 Send new <b>invite link</b> (send <code>-</code> to clear):",
+            "sort": "↕️ Send new <b>order number</b> (lower shows first):",
+        }
+        set_state(uid, f"adm_fj_{kind}", cid=cid)
+        return await render(cq, prompts[kind], akb([], f"adm:fj:ch:{cid}"))
 
     # ---------------- users ----------------
     if d.startswith("users:"):
@@ -2012,6 +2154,40 @@ async def admin_input(m: Message, st: dict):
 
     pop_state(uid)
 
+    if a == "adm_fj_add":
+        parts = [x.strip() for x in body.split("|")]
+        ident = parts[0].lstrip("@") if parts else ""
+        if not ident:
+            return await m.reply_text("⚠️ Format: <code>@username | Title | invite link</code>")
+        title = parts[1] if len(parts) > 1 and parts[1] else ident
+        link = parts[2] if len(parts) > 2 else ""
+        if ident.lstrip("-").isdigit() and not link:
+            return await m.reply_text("⚠️ Private channels need an invite link.\n"
+                                      "<code>-1001234567890 | VIP | https://t.me/+abc</code>")
+        nxt = (one("SELECT COALESCE(MAX(sort),0)+10 s FROM force_channels") or {}).get("s") or 10
+        run("""INSERT INTO force_channels(chat_id, title, invite_link, active, sort, added)
+               VALUES(?,?,?,1,?,?)""", (ident[:80], title[:60], link[:200], nxt, now_ts()))
+        audit("INFO", uid, "force_channel_add", ident)
+        return await m.reply_text(f"✅ Channel added: <b>{clean(title, 60)}</b>\n"
+                                  "⚠️ Make sure the bot is an admin in that channel.")
+
+    if a in ("adm_fj_edit", "adm_fj_title", "adm_fj_link", "adm_fj_sort"):
+        cid = st["cid"]
+        if a == "adm_fj_edit":
+            run("UPDATE force_channels SET chat_id=? WHERE id=?", (body.strip().lstrip("@")[:80], cid))
+        elif a == "adm_fj_title":
+            run("UPDATE force_channels SET title=? WHERE id=?", (body.strip()[:60], cid))
+        elif a == "adm_fj_link":
+            val = "" if body.strip() == "-" else body.strip()[:200]
+            run("UPDATE force_channels SET invite_link=? WHERE id=?", (val, cid))
+        else:
+            if not body.strip().lstrip("-").isdigit():
+                return await m.reply_text("⚠️ Send a number.")
+            run("UPDATE force_channels SET sort=? WHERE id=?", (int(body.strip()), cid))
+        audit("INFO", uid, "force_channel_edit", f"{cid} {a}")
+        return await m.reply_text("✅ Updated.", reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔙 Open channel", callback_data=f"adm:fj:ch:{cid}")]]))
+
     if a == "adm_user_search":
         target = body.lstrip("@")
         x = (get_user(int(target)) if target.isdigit()
@@ -2167,7 +2343,7 @@ async def admin_input(m: Message, st: dict):
 
 
 # =====================================================================
-# BACKGROUND WORKERS (status polling, auto refund, sync, backup)
+# BACKGROUND WORKERS (status polling, auto refund, service sync)
 # =====================================================================
 PENDING = ("pending", "processing", "in progress", "inprogress", "active", "queue", "partial")
 
@@ -2239,28 +2415,11 @@ async def worker_sync():
         await asyncio.sleep(max(600, SI("sync_interval", 21600)))
 
 
-async def worker_backup():
-    while True:
-        await asyncio.sleep(max(3600, SI("backup_interval", 86400)))
-        try:
-            path = os.path.join(BACKUP_DIR, f"auto_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
-            with _lock:
-                _conn.commit()
-                shutil.copy(DB_FILE, path)
-            files = sorted(os.listdir(BACKUP_DIR))
-            for f in files[:-10]:
-                os.remove(os.path.join(BACKUP_DIR, f))
-            audit("INFO", 0, "auto_backup", path)
-        except Exception as e:  # noqa: BLE001
-            audit("ERROR", 0, "worker_backup", str(e))
-
-
 async def on_startup():
     me = await app.get_me()
     set_setting("bot_username", me.username or "")
     asyncio.create_task(worker_status())
     asyncio.create_task(worker_sync())
-    asyncio.create_task(worker_backup())
     log.info("Bot online as @%s", me.username)
     for oid in OWNER_IDS:
         try:
