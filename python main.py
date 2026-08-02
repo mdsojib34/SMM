@@ -49,10 +49,10 @@ from pyrogram.types import (
 # =====================================================================
 # STEP 1 CONFIGURATION  (the ONLY place you must edit)
 # =====================================================================
-API_ID = int(os.getenv("36497386", "0"))                 # <-- my.telegram.org  API_ID
-API_HASH = os.getenv("bf09e9a32f89d28087b44bcdb043239c", "")                   # <-- my.telegram.org  API_HASH
-BOT_TOKEN = os.getenv("8995940738:AAEnVYIcC72TCi8aH620d9MH2DQIDAGKCMw", "")                 # <-- @BotFather token
-OWNER_IDS = [int(x) for x in os.getenv("ADMINS", "0").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()]
+API_ID = int(os.getenv("API_ID", "36497386"))                 # <-- my.telegram.org  API_ID
+API_HASH = os.getenv("API_HASH", "bf09e9a32f89d28087b44bcdb043239c")                   # <-- my.telegram.org  API_HASH
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8995940738:AAEnVYIcC72TCi8aH620d9MH2DQIDAGKCMw")                 # <-- @BotFather token
+OWNER_IDS = [int(x) for x in os.getenv("ADMINS", "6994836801").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()]
 DB_FILE = os.getenv("DB_FILE", "smm_panel.db")         # SQLite database file
 LOG_FILE = os.getenv("LOG_FILE", "smm_bot.log")
 SESSION_NAME = os.getenv("SESSION_NAME", "smm_panel_bot")
